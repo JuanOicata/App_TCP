@@ -1,4 +1,4 @@
-package org.vinni.servidor.gui;
+package servidor;
 
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
@@ -13,11 +13,18 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Servidor TCP con:
- *  - Registro de clientes por nombre (en memoria).
- *  - Reconocimiento de clientes que se reconectan con el mismo nombre.
- *  - Política de reinicio automático ante caída inesperada.
- *  - Tabla de sesiones activas/históricas.
+ * Servidor TCP con tres políticas:
+ *
+ *  A) DETENER manual → NO reinicia por caída.
+ *     Activa el vigilante para reaccionar si un cliente llama.
+ *
+ *  B) Caída inesperada → reinicio automático con backoff (hasta MAX_REINTENTOS).
+ *     Si agota los reintentos, activa el vigilante.
+ *
+ *  C) Vigilante → escucha en el puerto cuando el servidor está inactivo.
+ *     Al detectar un cliente, reinicia el servidor completo.
+ *     El vigilante también arranca al abrir la app (antes de pulsar INICIAR),
+ *     de modo que si hay clientes esperando se activa el servidor automáticamente.
  */
 public class PrincipalSrv extends JFrame {
 
@@ -27,40 +34,46 @@ public class PrincipalSrv extends JFrame {
     private static final int DELAY_REINICIO_SEG = 5;
     private static final DateTimeFormatter HORA = DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    // ── Registro de clientes (nombre → InfoCliente) ───────────────────────────
+    // ── Registro de clientes ──────────────────────────────────────────────────
     private static class InfoCliente {
         final String nombre;
-        int     sesiones          = 0;
-        int     mensajes          = 0;
-        String  ultimaConexion    = "—";
-        boolean conectado         = false;
-
-        InfoCliente(String nombre) { this.nombre = nombre; }
+        int     sesiones       = 0;
+        int     mensajes       = 0;
+        String  ultimaConexion = "—";
+        boolean conectado      = false;
+        InfoCliente(String n) { this.nombre = n; }
     }
-
     private final Map<String, InfoCliente> registro = new ConcurrentHashMap<>();
 
-    // ── Estado del servidor ──────────────────────────────────────────────────
-    private ServerSocket serverSocket;
-    private final AtomicBoolean corriendo        = new AtomicBoolean(false);
-    private final AtomicBoolean detenerManual    = new AtomicBoolean(false);
-    private final AtomicInteger intentosReinicio = new AtomicInteger(0);
+    // ── Estado ───────────────────────────────────────────────────────────────
+    private ServerSocket    serverSocket;
     private ExecutorService clientPool;
 
-    // ── Componentes GUI ──────────────────────────────────────────────────────
-    private JButton          btnIniciar, btnDetener;
-    private JTextArea        logTxt;
-    private JLabel           lblEstado;
-    private JTable           tabla;
+    private final AtomicBoolean corriendo        = new AtomicBoolean(false);
+    private final AtomicBoolean detenerManual    = new AtomicBoolean(false);
+    private final AtomicBoolean vigilanteActivo  = new AtomicBoolean(false);
+    private final AtomicInteger intentosReinicio = new AtomicInteger(0);
+
+    // ── GUI ───────────────────────────────────────────────────────────────────
+    private JButton           btnIniciar, btnDetener;
+    private JTextArea         logTxt;
+    private JLabel            lblEstado;
     private DefaultTableModel modeloTabla;
 
     // ─────────────────────────────────────────────────────────────────────────
-    public PrincipalSrv() { initComponents(); }
+    public PrincipalSrv() {
+        initComponents();
+        // Arrancar el vigilante al abrir la app:
+        // si un cliente ya está intentando conectarse antes de pulsar INICIAR,
+        // el servidor se activará automáticamente.
+        iniciarVigilante("Vigilante activo desde inicio de la app.");
+    }
 
+    // ── UI ────────────────────────────────────────────────────────────────────
     private void initComponents() {
         setTitle("Servidor TCP – Política de Reinicio");
         setDefaultCloseOperation(EXIT_ON_CLOSE);
-        setSize(600, 520);
+        setSize(600, 530);
         setLocationRelativeTo(null);
         getContentPane().setLayout(null);
 
@@ -73,7 +86,11 @@ public class PrincipalSrv extends JFrame {
         btnIniciar = new JButton("▶  INICIAR");
         btnIniciar.setFont(new Font("Segoe UI", Font.PLAIN, 13));
         btnIniciar.setBounds(20, 40, 130, 34);
-        btnIniciar.addActionListener(e -> iniciarServidor(false));
+        btnIniciar.addActionListener(e -> {
+            // Si el vigilante está corriendo, detenerlo antes de arrancar el servidor
+            vigilanteActivo.set(false);
+            iniciarServidor(false);
+        });
         add(btnIniciar);
 
         btnDetener = new JButton("■  DETENER");
@@ -83,23 +100,22 @@ public class PrincipalSrv extends JFrame {
         btnDetener.addActionListener(e -> detenerManualmente());
         add(btnDetener);
 
-        lblEstado = new JLabel("Estado: DETENIDO");
+        lblEstado = new JLabel("Estado: DETENIDO – vigilante activo");
         lblEstado.setFont(new Font("Segoe UI", Font.BOLD, 12));
         lblEstado.setForeground(Color.DARK_GRAY);
         lblEstado.setBounds(20, 82, 550, 18);
         add(lblEstado);
 
-        // ── Tabla de clientes registrados ──
         JLabel lblTabla = new JLabel("Clientes registrados:");
         lblTabla.setFont(new Font("Segoe UI", Font.BOLD, 12));
-        lblTabla.setBounds(20, 108, 200, 18);
+        lblTabla.setBounds(20, 108, 220, 18);
         add(lblTabla);
 
         modeloTabla = new DefaultTableModel(
                 new String[]{"Nombre", "Estado", "Sesiones", "Mensajes", "Última conexión"}, 0) {
             @Override public boolean isCellEditable(int r, int c) { return false; }
         };
-        tabla = new JTable(modeloTabla);
+        JTable tabla = new JTable(modeloTabla);
         tabla.setFont(new Font("Monospaced", Font.PLAIN, 12));
         tabla.getTableHeader().setFont(new Font("Segoe UI", Font.BOLD, 12));
         tabla.setRowHeight(20);
@@ -116,14 +132,16 @@ public class PrincipalSrv extends JFrame {
         logTxt.setEditable(false);
         logTxt.setFont(new Font("Monospaced", Font.PLAIN, 12));
         JScrollPane scrollLog = new JScrollPane(logTxt);
-        scrollLog.setBounds(20, 273, 550, 205);
+        scrollLog.setBounds(20, 273, 550, 215);
         add(scrollLog);
     }
 
-    // ── Lógica del servidor ───────────────────────────────────────────────────
+    // ── Arranque del servidor ─────────────────────────────────────────────────
 
     private void iniciarServidor(boolean esReinicio) {
         if (corriendo.get()) return;
+
+        vigilanteActivo.set(false);
         detenerManual.set(false);
         corriendo.set(true);
         clientPool = Executors.newCachedThreadPool();
@@ -155,9 +173,10 @@ public class PrincipalSrv extends JFrame {
                     log("⚠️  Caída inesperada: " + ex.getMessage());
                     corriendo.set(false);
                     marcarTodosDesconectados();
-                    politicaReinicio();
+                    politicaReinicioPorCaida();
                 } else {
                     log("🛑 Servidor detenido manualmente.");
+                    iniciarVigilante("Vigilante activo tras detención manual.");
                 }
             } finally {
                 corriendo.set(false);
@@ -165,28 +184,19 @@ public class PrincipalSrv extends JFrame {
                 SwingUtilities.invokeLater(() -> {
                     btnIniciar.setEnabled(true);
                     btnDetener.setEnabled(false);
-                    lblEstado.setText("Estado: DETENIDO");
-                    lblEstado.setForeground(Color.DARK_GRAY);
                 });
             }
         }, "hilo-servidor").start();
     }
 
-    /**
-     * Protocolo de handshake:
-     *   Servidor  →  "INGRESA_NOMBRE"
-     *   Cliente   →  "<nombre>"
-     *   Servidor  →  "BIENVENIDO_NUEVO:<nombre>"
-     *              o "BIENVENIDO_DE_NUEVO:<nombre>:sesion=N"
-     *   Luego comunicación normal (mensajes / ACK).
-     */
+    // ── Handshake + comunicación ──────────────────────────────────────────────
+
     private void manejarCliente(Socket socket) {
         String nombre = null;
         try (
                 BufferedReader in  = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                 PrintWriter    out = new PrintWriter(socket.getOutputStream(), true)
         ) {
-            // ── Handshake: solicitar nombre ──
             out.println("INGRESA_NOMBRE");
             nombre = in.readLine();
             if (nombre == null || nombre.isBlank()) {
@@ -195,8 +205,8 @@ public class PrincipalSrv extends JFrame {
             }
             nombre = nombre.trim();
 
-            InfoCliente info = registro.computeIfAbsent(nombre, InfoCliente::new);
-            boolean esNuevo  = info.sesiones == 0;
+            InfoCliente info    = registro.computeIfAbsent(nombre, InfoCliente::new);
+            boolean     esNuevo = info.sesiones == 0;
 
             info.sesiones++;
             info.conectado      = true;
@@ -206,12 +216,11 @@ public class PrincipalSrv extends JFrame {
                 log("👤 Nuevo cliente: [" + nombre + "]  " + socket.getRemoteSocketAddress());
                 out.println("BIENVENIDO_NUEVO:" + nombre);
             } else {
-                log("🔁 Reconexión de [" + nombre + "]  sesión #" + info.sesiones);
+                log("🔁 Reconexión: [" + nombre + "]  sesión #" + info.sesiones);
                 out.println("BIENVENIDO_DE_NUEVO:" + nombre + ":sesion=" + info.sesiones);
             }
             actualizarTabla();
 
-            // ── Bucle de mensajes ──
             String linea;
             while ((linea = in.readLine()) != null) {
                 info.mensajes++;
@@ -221,7 +230,7 @@ public class PrincipalSrv extends JFrame {
             }
 
         } catch (IOException ex) {
-            if (!detenerManual.get())
+            if (corriendo.get())
                 log("❌ Error con [" + (nombre != null ? nombre : "?") + "]: " + ex.getMessage());
         } finally {
             if (nombre != null && registro.containsKey(nombre)) {
@@ -233,26 +242,84 @@ public class PrincipalSrv extends JFrame {
         }
     }
 
-    // ── Política de reinicio automático ──────────────────────────────────────
+    // ── Política de reinicio por caída ────────────────────────────────────────
 
-    private void politicaReinicio() {
+    private void politicaReinicioPorCaida() {
         int intento = intentosReinicio.incrementAndGet();
         if (intento > MAX_REINTENTOS) {
-            log("🚫 Máximo de reinicios alcanzado (" + MAX_REINTENTOS + "). Servidor INACTIVO.");
+            log("🚫 Máximo de reinicios por caída (" + MAX_REINTENTOS + ") alcanzado.");
+            iniciarVigilante("Vigilante activo tras agotar reinicios por caída.");
             return;
         }
-        log("🔁 Reinicio automático: intento " + intento + "/" + MAX_REINTENTOS
+        log("🔁 Reinicio por caída " + intento + "/" + MAX_REINTENTOS
                 + " → esperando " + DELAY_REINICIO_SEG + "s…");
-        SwingUtilities.invokeLater(() -> lblEstado.setText(
-                "Estado: REINICIANDO (intento " + intento + "/" + MAX_REINTENTOS + ")"));
+        setEstado("Estado: REINICIANDO por caída (" + intento + "/" + MAX_REINTENTOS + ")",
+                new Color(180, 100, 0));
 
         new Thread(() -> {
             try {
                 TimeUnit.SECONDS.sleep(DELAY_REINICIO_SEG);
                 iniciarServidor(true);
             } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        }, "hilo-reinicio").start();
+        }, "hilo-reinicio-caida").start();
     }
+
+    // ── Vigilante ─────────────────────────────────────────────────────────────
+
+    /**
+     * Abre un ServerSocket temporal en el mismo puerto.
+     * Al detectar la primera conexión entrante:
+     *   1. Cierra la conexión del vigilante y libera el puerto.
+     *   2. Espera 300ms para asegurar liberación del puerto.
+     *   3. Arranca el servidor real completo.
+     * El cliente, que estaba reintentando, conectará en su siguiente intento.
+     */
+    private void iniciarVigilante(String motivo) {
+        if (vigilanteActivo.getAndSet(true)) return; // solo uno a la vez
+
+        log("👁️  " + motivo);
+        setEstado("Estado: DETENIDO – vigilante escuchando en puerto " + PORT, Color.DARK_GRAY);
+        SwingUtilities.invokeLater(() -> {
+            btnIniciar.setEnabled(true);
+            btnDetener.setEnabled(false);
+        });
+
+        new Thread(() -> {
+            ServerSocket sv = null;
+            try {
+                sv = new ServerSocket();
+                sv.setReuseAddress(true);
+                sv.bind(new InetSocketAddress(PORT));
+                log("👁️  Vigilante listo. Esperando primer cliente en puerto " + PORT + "…");
+
+                Socket primer = sv.accept(); // bloquea hasta que llega alguien
+                log("👁️  Vigilante detectó cliente: " + primer.getRemoteSocketAddress()
+                        + "  → reiniciando servidor…");
+
+                try { primer.close(); } catch (IOException ignored) {}
+                try { sv.close();    } catch (IOException ignored) {}
+                sv = null;
+
+                TimeUnit.MILLISECONDS.sleep(300); // asegurar liberación del puerto
+
+                vigilanteActivo.set(false);
+                intentosReinicio.set(0);
+                iniciarServidor(true);
+
+            } catch (IOException ex) {
+                // Solo loguear si el vigilante no fue cancelado intencionalmente
+                if (vigilanteActivo.get())
+                    log("👁️  Vigilante detenido inesperadamente: " + ex.getMessage());
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            } finally {
+                vigilanteActivo.set(false);
+                if (sv != null) try { sv.close(); } catch (IOException ignored) {}
+            }
+        }, "hilo-vigilante").start();
+    }
+
+    // ── Detención manual ──────────────────────────────────────────────────────
 
     private void detenerManualmente() {
         if (!corriendo.get()) return;
@@ -260,8 +327,10 @@ public class PrincipalSrv extends JFrame {
         corriendo.set(false);
         marcarTodosDesconectados();
         cerrarRecursos();
-        log("🛑 Servidor detenido por el usuario. (NO se ejecutará política de reinicio)");
+        // El vigilante se lanza desde el catch del hilo-servidor
     }
+
+    // ── Utilidades ────────────────────────────────────────────────────────────
 
     private void cerrarRecursos() {
         try {
@@ -274,8 +343,6 @@ public class PrincipalSrv extends JFrame {
         registro.values().forEach(i -> i.conectado = false);
         actualizarTabla();
     }
-
-    // ── Tabla ─────────────────────────────────────────────────────────────────
 
     private void actualizarTabla() {
         SwingUtilities.invokeLater(() -> {
@@ -292,7 +359,12 @@ public class PrincipalSrv extends JFrame {
         });
     }
 
-    // ── Utilidades ────────────────────────────────────────────────────────────
+    private void setEstado(String texto, Color color) {
+        SwingUtilities.invokeLater(() -> {
+            lblEstado.setText(texto);
+            lblEstado.setForeground(color);
+        });
+    }
 
     private void log(String msg) {
         String ts = "[" + LocalTime.now().format(HORA) + "] ";

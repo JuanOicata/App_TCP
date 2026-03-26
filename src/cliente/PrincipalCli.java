@@ -1,4 +1,4 @@
-package org.vinni.cliente.gui;
+package cliente;
 
 import javax.swing.*;
 import java.awt.*;
@@ -11,39 +11,48 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Cliente TCP con:
- *  - Nombre de identidad: se pide al iniciar la app y persiste en reconexiones.
- *  - Instancia única por ejecución (un cliente = una ventana).
- *  - Políticas de reintentos, timeout y reconexión automática.
- *  - Envío deshabilitado cuando no hay conexión activa.
+ * Cliente TCP con dos fases de reconexión:
+ *
+ *  FASE 1 – Reintentos rápidos:
+ *    Hasta MAX_REINTENTOS intentos, cada DELAY_RAPIDO_S segundos.
+ *    Cubre el caso: servidor se acaba de caer, debería volver pronto.
+ *
+ *  FASE 2 – Espera pasiva (infinita):
+ *    Si se agotan los reintentos rápidos, el cliente NO abandona.
+ *    Sigue intentando cada DELAY_PASIVO_S segundos indefinidamente,
+ *    esperando que el servidor (o su vigilante) vuelva a estar activo.
+ *    El usuario puede cancelar manualmente con DESCONECTAR.
  */
 public class PrincipalCli extends JFrame {
 
     // ── Configuración ────────────────────────────────────────────────────────
-    private static final String HOST              = "localhost";
-    private static final int    PORT              = 12345;
-    private static final int    MAX_REINTENTOS    = 10;
-    private static final int    TIMEOUT_CONN_MS   = 3_000;
-    private static final int    DELAY_REINTENTO_S = 4;
-    private static final DateTimeFormatter HORA   = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final String HOST            = "localhost";
+    private static final int    PORT            = 12345;
+    private static final int    MAX_REINTENTOS  = 10;       // reintentos rápidos
+    private static final int    TIMEOUT_CONN_MS = 3_000;    // timeout por intento
+    private static final int    DELAY_RAPIDO_S  = 4;        // espera entre reintentos rápidos
+    private static final int    DELAY_PASIVO_S  = 15;       // espera en modo pasivo
+    private static final DateTimeFormatter HORA = DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    // ── Identidad del cliente ─────────────────────────────────────────────────
-    private final String nombre;   // fijo durante toda la ejecución
+    // ── Identidad ─────────────────────────────────────────────────────────────
+    private final String nombre;
 
     // ── Estado ───────────────────────────────────────────────────────────────
     private Socket         socket;
     private PrintWriter    out;
     private BufferedReader in;
 
-    private final AtomicBoolean conectado      = new AtomicBoolean(false);
-    private final AtomicBoolean detener        = new AtomicBoolean(false);
-    private final AtomicInteger intentos       = new AtomicInteger(0);
+    private final AtomicBoolean conectado   = new AtomicBoolean(false);
+    private final AtomicBoolean detener     = new AtomicBoolean(false);
+    private final AtomicInteger intentos    = new AtomicInteger(0);
+    /** true = ya agotó reintentos rápidos, está en espera pasiva */
+    private final AtomicBoolean modoPasivo  = new AtomicBoolean(false);
 
-    // ── Componentes GUI ──────────────────────────────────────────────────────
+    // ── GUI ───────────────────────────────────────────────────────────────────
     private JButton    btnConectar, btnDesconectar, btnEnviar;
     private JTextArea  logTxt;
     private JTextField mensajeTxt;
-    private JLabel     lblEstado, lblNombre;
+    private JLabel     lblEstado;
 
     // ─────────────────────────────────────────────────────────────────────────
     public PrincipalCli(String nombre) {
@@ -51,7 +60,6 @@ public class PrincipalCli extends JFrame {
         initComponents();
     }
 
-    // ── UI ────────────────────────────────────────────────────────────────────
     private void initComponents() {
         setTitle("Cliente TCP  [" + nombre + "]");
         setDefaultCloseOperation(EXIT_ON_CLOSE);
@@ -65,14 +73,12 @@ public class PrincipalCli extends JFrame {
         titulo.setBounds(10, 8, 480, 22);
         add(titulo);
 
-        // ── Nombre del cliente ──
-        lblNombre = new JLabel("Identidad:  " + nombre);
+        JLabel lblNombre = new JLabel("Identidad:  " + nombre);
         lblNombre.setFont(new Font("Segoe UI", Font.BOLD, 13));
         lblNombre.setForeground(new Color(0, 100, 0));
         lblNombre.setBounds(20, 36, 460, 18);
         add(lblNombre);
 
-        // ── Botones ──
         btnConectar = new JButton("▶  CONECTAR");
         btnConectar.setFont(new Font("Segoe UI", Font.PLAIN, 13));
         btnConectar.setBounds(20, 62, 145, 34);
@@ -86,14 +92,12 @@ public class PrincipalCli extends JFrame {
         btnDesconectar.addActionListener(e -> desconectarManualmente());
         add(btnDesconectar);
 
-        // ── Estado ──
         lblEstado = new JLabel("Estado: DESCONECTADO");
         lblEstado.setFont(new Font("Segoe UI", Font.BOLD, 12));
         lblEstado.setForeground(Color.DARK_GRAY);
         lblEstado.setBounds(20, 103, 460, 18);
         add(lblEstado);
 
-        // ── Envío de mensajes ──
         JLabel lbl = new JLabel("Mensaje:");
         lbl.setFont(new Font("Verdana", Font.PLAIN, 13));
         lbl.setBounds(20, 130, 90, 26);
@@ -113,7 +117,6 @@ public class PrincipalCli extends JFrame {
         btnEnviar.addActionListener(e -> enviarMensaje());
         add(btnEnviar);
 
-        // ── Log ──
         logTxt = new JTextArea();
         logTxt.setEditable(false);
         logTxt.setFont(new Font("Monospaced", Font.PLAIN, 12));
@@ -127,45 +130,63 @@ public class PrincipalCli extends JFrame {
     private void iniciarConexion() {
         if (conectado.get()) return;
         detener.set(false);
+        modoPasivo.set(false);
         intentos.set(0);
         setBotonConectar(false);
+        // Habilitar DESCONECTAR para que el usuario pueda cancelar en cualquier momento
+        SwingUtilities.invokeLater(() -> btnDesconectar.setEnabled(true));
         new Thread(this::cicloConexion, "hilo-cx-" + nombre).start();
     }
 
     /**
-     * Ciclo principal de reintentos / reconexión.
-     * Cuando la conexión se pierde (sin ser voluntaria) vuelve a reintentar.
+     * Ciclo de conexión con dos fases:
+     *   - Fase 1: reintentos rápidos (limitados).
+     *   - Fase 2: espera pasiva infinita hasta que el usuario cancele.
      */
     private void cicloConexion() {
         while (!detener.get()) {
 
-            int intento = intentos.incrementAndGet();
-            if (intento > MAX_REINTENTOS) {
-                log("🚫 Máximo de reintentos (" + MAX_REINTENTOS + ") alcanzado. Abandonando.");
-                setEstado("Estado: AGOTÓ REINTENTOS", Color.RED);
-                setBotonConectar(true);
-                return;
+            // ── Determinar delay y etiqueta según la fase actual ──────────────
+            boolean esPasivo = modoPasivo.get();
+            int     delay    = esPasivo ? DELAY_PASIVO_S : DELAY_RAPIDO_S;
+
+            if (!esPasivo) {
+                int intento = intentos.incrementAndGet();
+
+                // Transición a modo pasivo al agotar reintentos rápidos
+                if (intento > MAX_REINTENTOS) {
+                    modoPasivo.set(true);
+                    log("⏸️  Reintentos rápidos agotados. Entrando en espera pasiva "
+                            + "(cada " + DELAY_PASIVO_S + "s). Pulsa DESCONECTAR para cancelar.");
+                    setEstado("Estado: ESPERA PASIVA – intentando cada " + DELAY_PASIVO_S + "s",
+                            new Color(120, 0, 120));
+                    intentos.set(0);
+                    continue; // volver al inicio del while ya en modo pasivo
+                }
+
+                log("🔄 Intento rápido " + intento + "/" + MAX_REINTENTOS
+                        + "  →  " + HOST + ":" + PORT
+                        + "  (timeout " + TIMEOUT_CONN_MS + "ms)");
+                setEstado("Estado: CONECTANDO… (" + intento + "/" + MAX_REINTENTOS + ")",
+                        new Color(180, 100, 0));
+            } else {
+                log("🔄 Espera pasiva → intentando " + HOST + ":" + PORT
+                        + "  (timeout " + TIMEOUT_CONN_MS + "ms)");
             }
 
-            log("🔄 Intento " + intento + "/" + MAX_REINTENTOS
-                    + "  →  " + HOST + ":" + PORT
-                    + "  (timeout " + TIMEOUT_CONN_MS + "ms)");
-            setEstado("Estado: CONECTANDO… (" + intento + "/" + MAX_REINTENTOS + ")",
-                    new Color(180, 100, 0));
-
+            // ── Intento de conexión ───────────────────────────────────────────
             try {
                 socket = new Socket();
                 socket.connect(new InetSocketAddress(HOST, PORT), TIMEOUT_CONN_MS);
                 out = new PrintWriter(socket.getOutputStream(), true);
                 in  = new BufferedReader(new InputStreamReader(socket.getInputStream()));
 
-                // ── Handshake con el servidor ──
-                String primera = in.readLine();           // espera "INGRESA_NOMBRE"
+                // ── Handshake ──
+                String primera = in.readLine();
                 if ("INGRESA_NOMBRE".equals(primera)) {
-                    out.println(nombre);                  // envía el nombre registrado
-                    String respuesta = in.readLine();     // BIENVENIDO_NUEVO o BIENVENIDO_DE_NUEVO
+                    out.println(nombre);
+                    String respuesta = in.readLine();
                     if (respuesta != null && respuesta.startsWith("BIENVENIDO_DE_NUEVO")) {
-                        // Extraer número de sesión del mensaje "BIENVENIDO_DE_NUEVO:nombre:sesion=N"
                         String[] partes = respuesta.split(":");
                         String sesion = partes.length >= 3 ? partes[2] : "";
                         log("🔁 Reconectado como [" + nombre + "]  (" + sesion + ")");
@@ -178,43 +199,49 @@ public class PrincipalCli extends JFrame {
                     break;
                 }
 
+                // ── Conexión exitosa: resetear estado ──
                 conectado.set(true);
+                modoPasivo.set(false);
                 intentos.set(0);
                 setEstado("Estado: CONECTADO  →  " + HOST + ":" + PORT, new Color(0, 140, 0));
                 setEnvioHabilitado(true);
 
-                escucharServidor();   // bloquea hasta que cae la conexión
+                escucharServidor(); // bloquea hasta que cae la conexión
 
-                // ── Llegamos aquí: la conexión terminó ──
+                // ── Conexión perdida ──
                 setEnvioHabilitado(false);
                 conectado.set(false);
 
                 if (detener.get()) {
                     log("🛑 Desconectado voluntariamente.");
                     break;
-                } else {
-                    log("⚠️  Conexión perdida. Iniciando política de reconexión…");
-                    setEstado("Estado: RECONECTANDO…", new Color(180, 100, 0));
-                    intentos.set(0);  // reinicia contador para la nueva ronda
                 }
 
+                log("⚠️  Conexión perdida. Iniciando reintentos rápidos…");
+                setEstado("Estado: RECONECTANDO…", new Color(180, 100, 0));
+                modoPasivo.set(false);
+                intentos.set(0);
+                continue; // ir directo al siguiente intento sin esperar
+
             } catch (SocketTimeoutException ste) {
-                log("⏱️  Timeout en intento " + intento + " (" + TIMEOUT_CONN_MS + "ms)");
+                log("⏱️  Timeout" + (esPasivo ? " (pasivo)" : " intento " + intentos.get())
+                        + ": servidor no responde en " + TIMEOUT_CONN_MS + "ms");
             } catch (ConnectException ce) {
-                log("❌ Intento " + intento + " fallido: " + ce.getMessage());
+                log("❌ " + (esPasivo ? "[Pasivo]" : "Intento " + intentos.get())
+                        + " fallido: " + ce.getMessage());
             } catch (IOException ex) {
-                log("❌ Error E/S en intento " + intento + ": " + ex.getMessage());
+                log("❌ Error E/S: " + ex.getMessage());
             }
 
-            // Esperar antes del próximo reintento
-            if (!detener.get() && intentos.get() < MAX_REINTENTOS) {
-                log("⏳ Esperando " + DELAY_REINTENTO_S + "s…");
-                try { TimeUnit.SECONDS.sleep(DELAY_REINTENTO_S); }
+            // ── Esperar antes del próximo intento ─────────────────────────────
+            if (!detener.get()) {
+                log("⏳ Esperando " + delay + "s…");
+                try { TimeUnit.SECONDS.sleep(delay); }
                 catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
             }
         }
 
-        // Limpieza final
+        // ── Limpieza final ────────────────────────────────────────────────────
         cerrarSocket();
         setEnvioHabilitado(false);
         setBotonConectar(true);
@@ -222,7 +249,6 @@ public class PrincipalCli extends JFrame {
         SwingUtilities.invokeLater(() -> btnDesconectar.setEnabled(false));
     }
 
-    /** Lee mensajes del servidor hasta que la conexión se cierra. */
     private void escucharServidor() {
         try {
             String linea;
@@ -233,17 +259,24 @@ public class PrincipalCli extends JFrame {
             if (!detener.get())
                 log("⚠️  Conexión interrumpida: " + ex.getMessage());
         }
-        SwingUtilities.invokeLater(() -> {
-            btnEnviar.setEnabled(false);
-            mensajeTxt.setEnabled(false);
-        });
     }
 
     private void enviarMensaje() {
         if (!conectado.get() || out == null) return;
         String texto = mensajeTxt.getText().trim();
         if (texto.isEmpty()) return;
+
         out.println(texto);
+
+        if (out.checkError()) {
+            log("⚠️  No se pudo enviar: conexión perdida.");
+            conectado.set(false);
+            setEnvioHabilitado(false);
+            setEstado("Estado: RECONECTANDO…", new Color(180, 100, 0));
+            cerrarSocket();
+            return;
+        }
+
         log("→ Enviado: " + texto);
         mensajeTxt.setText("");
     }
@@ -260,18 +293,17 @@ public class PrincipalCli extends JFrame {
         } catch (IOException ignored) {}
     }
 
-    // ── Utilidades de UI ─────────────────────────────────────────────────────
+    // ── Utilidades UI ─────────────────────────────────────────────────────────
 
-    private void setEnvioHabilitado(boolean habilitado) {
+    private void setEnvioHabilitado(boolean h) {
         SwingUtilities.invokeLater(() -> {
-            mensajeTxt.setEnabled(habilitado);
-            btnEnviar.setEnabled(habilitado);
-            btnDesconectar.setEnabled(habilitado);
+            mensajeTxt.setEnabled(h);
+            btnEnviar.setEnabled(h);
         });
     }
 
-    private void setBotonConectar(boolean habilitado) {
-        SwingUtilities.invokeLater(() -> btnConectar.setEnabled(habilitado));
+    private void setBotonConectar(boolean h) {
+        SwingUtilities.invokeLater(() -> btnConectar.setEnabled(h));
     }
 
     private void setEstado(String texto, Color color) {
@@ -289,21 +321,16 @@ public class PrincipalCli extends JFrame {
         });
     }
 
-    // ── Main ─────────────────────────────────────────────────────────────────
-    // Cada ejecución de este main = un cliente independiente.
+    // ── Main ──────────────────────────────────────────────────────────────────
 
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> {
-            // Pedir nombre antes de abrir la ventana principal
             String nombre = null;
             while (nombre == null || nombre.isBlank()) {
                 nombre = JOptionPane.showInputDialog(
-                        null,
-                        "Ingresa tu nombre de cliente:",
-                        "Identificación de Cliente",
-                        JOptionPane.QUESTION_MESSAGE
-                );
-                if (nombre == null) System.exit(0); // usuario canceló
+                        null, "Ingresa tu nombre de cliente:",
+                        "Identificación de Cliente", JOptionPane.QUESTION_MESSAGE);
+                if (nombre == null) System.exit(0);
                 nombre = nombre.trim();
                 if (nombre.isBlank())
                     JOptionPane.showMessageDialog(null, "El nombre no puede estar vacío.");
